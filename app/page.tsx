@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
 
 type Attachment = { name: string; type: string; data: string };
 type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string } | null };
@@ -26,6 +26,9 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
   const [onlineCount, setOnlineCount] = useState(1);
+  const [ttlSeconds, setTtlSeconds] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -56,9 +59,10 @@ export default function Home() {
       const params = new URLSearchParams({ room: roomId, session: sessionId, nickname });
       const response = await fetch(`/api/messages?${params.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Connessione al server non riuscita.");
-      const data = await response.json() as { messages: ChatMessage[]; onlineCount?: number };
+      const data = await response.json() as { messages: ChatMessage[]; onlineCount?: number; ttlSeconds?: number };
       setMessages(data.messages);
       setOnlineCount(data.onlineCount ?? 1);
+      setTtlSeconds(data.ttlSeconds ?? 0);
       setError("");
     } catch {
       setError("Non riesco a raggiungere la chat. Riprovo tra poco.");
@@ -140,6 +144,45 @@ export default function Home() {
     window.setTimeout(() => setCopied(false), 1800);
   }
 
+  async function changeTimer(value: string) {
+    const ttl = Number(value);
+    setSavingSettings(true);
+    try {
+      const response = await fetch("/api/messages", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ room: roomId, nickname, ttlSeconds: ttl }),
+      });
+      if (!response.ok) throw new Error("Impostazione non salvata.");
+      setTtlSeconds(ttl);
+      setError("");
+    } catch {
+      setError("Non riesco a salvare il timer. Riprova.");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function clearChat() {
+    if (!window.confirm("Svuotare la conversazione per entrambi? I messaggi e gli allegati verranno eliminati definitivamente.")) return;
+    setSavingSettings(true);
+    try {
+      const response = await fetch("/api/messages", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ room: roomId, nickname }),
+      });
+      if (!response.ok) throw new Error("Chat non svuotata.");
+      setMessages([]);
+      setError("");
+      setShowSettings(false);
+    } catch {
+      setError("Non riesco a svuotare la chat. Riprova.");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
   function leave() {
     window.localStorage.removeItem("duetto-nickname");
     setNickname("");
@@ -186,7 +229,8 @@ export default function Home() {
     <main className="chat-page">
       <aside className="rail"><a className="rail-brand" href="#" aria-label="Duetto"><span className="brand-mark"><MessageCircle size={17} strokeWidth={2.4} /></span></a><div className="rail-center"><div className="rail-room active"><span>♡</span><i /></div><button className="rail-add" onClick={copyLink} aria-label="Copia invito"><span>+</span></button></div><button className="rail-profile" onClick={leave} title="Esci dalla chat"><span style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span></button></aside>
       <section className="chat-shell">
-        <header className="chat-header"><div className="chat-title-group"><button className="mobile-back" onClick={leave} aria-label="Esci"><ArrowLeft size={18} /></button><div className="room-symbol">♡</div><div><h1>Il salotto</h1><p><span className="live-dot" /> {onlineCount > 1 ? "Ci siete in due" : "Il tuo piccolo spazio"}</p></div></div><div className="header-actions"><button className={`invite-button ${copied ? "copied" : ""}`} onClick={copyLink}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "Link copiato" : "Invita qualcuno"}</button><button className="more-button" onClick={leave} aria-label="Esci dalla chat"><MoreHorizontal size={19} /></button></div></header>
+        <header className="chat-header"><div className="chat-title-group"><button className="mobile-back" onClick={leave} aria-label="Esci"><ArrowLeft size={18} /></button><div className="room-symbol">♡</div><div><h1>Il salotto</h1><p><span className="live-dot" /> {onlineCount > 1 ? "Ci siete in due" : "Il tuo piccolo spazio"}</p></div></div><div className="header-actions"><button className={`invite-button ${copied ? "copied" : ""}`} onClick={copyLink}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "Link copiato" : "Invita qualcuno"}</button><button className="more-button" onClick={() => setShowSettings((value) => !value)} aria-label="Impostazioni chat" aria-expanded={showSettings}><MoreHorizontal size={19} /></button></div></header>
+        {showSettings && <div className="room-menu" role="dialog" aria-label="Impostazioni chat"><label htmlFor="message-ttl"><Timer size={14} /> Autodistruzione messaggi</label><select id="message-ttl" value={ttlSeconds} disabled={savingSettings} onChange={(event) => void changeTimer(event.target.value)}><option value={0}>Disattivata</option><option value={3600}>Dopo 1 ora</option><option value={86400}>Dopo 1 giorno</option><option value={604800}>Dopo 7 giorni</option></select><p>Il timer vale per i messaggi inviati da questo momento.</p><div className="menu-divider" /><button className="clear-chat-button" onClick={() => void clearChat()} disabled={savingSettings}><Trash2 size={14} /> {savingSettings ? "Attendi…" : "Svuota chat per entrambi"}</button></div>}
         <div className="conversation">
           <div className="conversation-inner">
             <div className="welcome-card"><div className="welcome-icon"><MessageCircle size={19} /></div><p className="welcome-kicker">BENVENUTI NEL VOSTRO SPAZIO</p><h2>Le conversazioni<br />cominciano da qui.</h2><p>Solo voi due. Nessuna fretta.</p><div className="welcome-rule"><span /></div></div>

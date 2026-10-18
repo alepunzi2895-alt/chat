@@ -34,6 +34,16 @@ function database() {
       data TEXT NOT NULL
     )`);
     await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS attachments_room ON attachments(room)");
+    await globalForDb.duettoDb!.execute(`CREATE TABLE IF NOT EXISTS room_settings (
+      room TEXT PRIMARY KEY,
+      ttl_seconds INTEGER NOT NULL DEFAULT 0
+    )`);
+    await globalForDb.duettoDb!.execute(`CREATE TABLE IF NOT EXISTS message_expiry (
+      message_id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    )`);
+    await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS message_expiry_room_date ON message_expiry(room, expires_at)");
   });
   return { db: globalForDb.duettoDb, ready: globalForDb.duettoReady };
 }
@@ -50,6 +60,10 @@ export async function GET(request: NextRequest) {
   try {
     const { db, ready } = database();
     await ready;
+    const now = new Date().toISOString();
+    await db.execute({ sql: "DELETE FROM attachments WHERE room = ? AND message_id IN (SELECT message_id FROM message_expiry WHERE room = ? AND expires_at <= ?)", args: [room, room, now] });
+    await db.execute({ sql: "DELETE FROM messages WHERE room = ? AND id IN (SELECT message_id FROM message_expiry WHERE room = ? AND expires_at <= ?)", args: [room, room, now] });
+    await db.execute({ sql: "DELETE FROM message_expiry WHERE room = ? AND expires_at <= ?", args: [room, now] });
     const attachmentId = request.nextUrl.searchParams.get("attachmentId");
     if (attachmentId) {
       const file = await db.execute({ sql: "SELECT name, type, data FROM attachments WHERE message_id = ? AND room = ?", args: [attachmentId, room] });
@@ -68,7 +82,8 @@ export async function GET(request: NextRequest) {
     const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room WHERE m.room = ? ORDER BY m.created_at ASC LIMIT 200", args: [room] });
     const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null }));
     const people = await db.execute({ sql: "SELECT COUNT(*) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
-    return NextResponse.json({ messages, onlineCount: Number(people.rows[0]?.count ?? 1) }, { headers: { "cache-control": "no-store" } });
+    const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
+    return NextResponse.json({ messages, onlineCount: Number(people.rows[0]?.count ?? 1), ttlSeconds: Number(setting.rows[0]?.ttl_seconds ?? 0) }, { headers: { "cache-control": "no-store" } });
   } catch (error) {
     console.error("Turso read error:", error);
     return NextResponse.json({ error: "Impossibile caricare i messaggi." }, { status: 503 });
@@ -95,9 +110,52 @@ export async function POST(request: NextRequest) {
     await ready;
     await db.execute({ sql: "INSERT INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, nickname.trim(), body.trim(), createdAt] });
     if (file) await db.execute({ sql: "INSERT INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, (file.data as string).split(",", 2)[1]] });
+    const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
+    const ttlSeconds = Number(setting.rows[0]?.ttl_seconds ?? 0);
+    if (ttlSeconds > 0) {
+      await db.execute({ sql: "INSERT INTO message_expiry (message_id, room, expires_at) VALUES (?, ?, ?)", args: [id, room, new Date(Date.now() + ttlSeconds * 1000).toISOString()] });
+    }
     return NextResponse.json({ message: { id, nickname: nickname.trim(), body: body.trim(), createdAt } }, { status: 201 });
   } catch (error) {
     console.error("Turso write error:", error);
     return NextResponse.json({ error: "Impossibile salvare il messaggio." }, { status: 503 });
+  }
+}
+
+export async function PATCH(request: NextRequest) {
+  let payload: unknown;
+  try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
+  if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
+  const { room, nickname, ttlSeconds } = payload as Record<string, unknown>;
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || ![0, 3600, 86400, 604800].includes(Number(ttlSeconds))) {
+    return NextResponse.json({ error: "Impostazioni non valide." }, { status: 400 });
+  }
+  try {
+    const { db, ready } = database();
+    await ready;
+    await db.execute({ sql: "INSERT INTO room_settings (room, ttl_seconds) VALUES (?, ?) ON CONFLICT(room) DO UPDATE SET ttl_seconds = excluded.ttl_seconds", args: [room, Number(ttlSeconds)] });
+    return NextResponse.json({ ttlSeconds: Number(ttlSeconds) });
+  } catch (error) {
+    console.error("Turso settings error:", error);
+    return NextResponse.json({ error: "Impossibile aggiornare le impostazioni." }, { status: 503 });
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  let payload: unknown;
+  try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
+  if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
+  const { room, nickname } = payload as Record<string, unknown>;
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24) return NextResponse.json({ error: "Stanza o nickname non validi." }, { status: 400 });
+  try {
+    const { db, ready } = database();
+    await ready;
+    await db.execute({ sql: "DELETE FROM attachments WHERE room = ?", args: [room] });
+    await db.execute({ sql: "DELETE FROM message_expiry WHERE room = ?", args: [room] });
+    const result = await db.execute({ sql: "DELETE FROM messages WHERE room = ?", args: [room] });
+    return NextResponse.json({ deleted: result.rowsAffected });
+  } catch (error) {
+    console.error("Turso clear chat error:", error);
+    return NextResponse.json({ error: "Impossibile svuotare la chat." }, { status: 503 });
   }
 }
