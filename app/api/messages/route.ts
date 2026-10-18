@@ -26,6 +26,14 @@ function database() {
       PRIMARY KEY (room, session_id)
     )`);
     await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS participants_room_seen ON participants(room, last_seen)");
+    await globalForDb.duettoDb!.execute(`CREATE TABLE IF NOT EXISTS attachments (
+      message_id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      data TEXT NOT NULL
+    )`);
+    await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS attachments_room ON attachments(room)");
   });
   return { db: globalForDb.duettoDb, ready: globalForDb.duettoReady };
 }
@@ -42,14 +50,23 @@ export async function GET(request: NextRequest) {
   try {
     const { db, ready } = database();
     await ready;
+    const attachmentId = request.nextUrl.searchParams.get("attachmentId");
+    if (attachmentId) {
+      const file = await db.execute({ sql: "SELECT name, type, data FROM attachments WHERE message_id = ? AND room = ?", args: [attachmentId, room] });
+      const row = file.rows[0];
+      if (!row) return NextResponse.json({ error: "File non trovato." }, { status: 404 });
+      const binary = atob(String(row.data));
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      return new NextResponse(bytes, { headers: { "content-type": String(row.type), "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(String(row.name))}`, "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" } });
+    }
     const lastSeen = new Date().toISOString();
     await db.execute({
       sql: "INSERT INTO participants (room, session_id, nickname, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(room, session_id) DO UPDATE SET nickname = excluded.nickname, last_seen = excluded.last_seen",
       args: [room, session, nickname, lastSeen],
     });
     await db.execute({ sql: "DELETE FROM participants WHERE room = ? AND last_seen < ?", args: [room, new Date(Date.now() - 60_000).toISOString()] });
-    const result = await db.execute({ sql: "SELECT id, nickname, body, created_at FROM messages WHERE room = ? ORDER BY created_at ASC LIMIT 200", args: [room] });
-    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at) }));
+    const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room WHERE m.room = ? ORDER BY m.created_at ASC LIMIT 200", args: [room] });
+    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null }));
     const people = await db.execute({ sql: "SELECT COUNT(*) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
     return NextResponse.json({ messages, onlineCount: Number(people.rows[0]?.count ?? 1) }, { headers: { "cache-control": "no-store" } });
   } catch (error) {
@@ -62,8 +79,13 @@ export async function POST(request: NextRequest) {
   let payload: unknown;
   try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
   if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
-  const { room, nickname, body } = payload as Record<string, unknown>;
-  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || typeof body !== "string" || !body.trim() || body.length > 2000) {
+  const { room, nickname, body, attachment } = payload as Record<string, unknown>;
+  const hasAttachment = attachment !== undefined && attachment !== null;
+  const file = hasAttachment && typeof attachment === "object" ? attachment as Record<string, unknown> : null;
+  const data = typeof file?.data === "string" ? file.data : "";
+  const encoded = data.split(",", 2)[1] ?? "";
+  const validAttachment = !hasAttachment || (!!file && typeof file.name === "string" && file.name.length <= 180 && typeof file.type === "string" && (/^image\/(jpeg|png|gif|webp|avif)$/.test(file.type) || /^video\/(mp4|webm|quicktime)$/.test(file.type)) && data.startsWith(`data:${file.type};base64,`) && encoded.length <= 3_500_000 && /^[A-Za-z0-9+/]*={0,2}$/.test(encoded));
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || typeof body !== "string" || body.length > 2000 || (!body.trim() && !hasAttachment) || !validAttachment) {
     return NextResponse.json({ error: "Nickname o messaggio non valido." }, { status: 400 });
   }
   const id = crypto.randomUUID();
@@ -72,6 +94,7 @@ export async function POST(request: NextRequest) {
     const { db, ready } = database();
     await ready;
     await db.execute({ sql: "INSERT INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, nickname.trim(), body.trim(), createdAt] });
+    if (file) await db.execute({ sql: "INSERT INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, (file.data as string).split(",", 2)[1]] });
     return NextResponse.json({ message: { id, nickname: nickname.trim(), body: body.trim(), createdAt } }, { status: 201 });
   } catch (error) {
     console.error("Turso write error:", error);

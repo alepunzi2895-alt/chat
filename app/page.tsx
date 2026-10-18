@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X } from "lucide-react";
 
-type ChatMessage = { id: string; nickname: string; body: string; createdAt: string };
+type Attachment = { name: string; type: string; data: string };
+type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string } | null };
 
 const colors = ["#f0a978", "#9f9ee8", "#72b8aa", "#db88a1"];
 const initials = (name: string) => name.trim().slice(0, 1).toUpperCase();
@@ -19,6 +20,7 @@ export default function Home() {
   const [draftName, setDraftName] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
+  const [attachment, setAttachment] = useState<Attachment | null>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -26,6 +28,7 @@ export default function Home() {
   const [onlineCount, setOnlineCount] = useState(1);
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -87,7 +90,7 @@ export default function Home() {
   async function send(event: FormEvent) {
     event.preventDefault();
     const body = draft.trim();
-    if (!body || sending) return;
+    if ((!body && !attachment) || sending) return;
     setSending(true);
     setDraft("");
     if (inputRef.current) inputRef.current.style.height = "auto";
@@ -95,10 +98,11 @@ export default function Home() {
       const response = await fetch("/api/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ room: roomId, nickname, body }),
+        body: JSON.stringify({ room: roomId, nickname, body, attachment }),
       });
       if (!response.ok) throw new Error("Messaggio non inviato.");
       await fetchMessages();
+      setAttachment(null);
     } catch {
       setDraft(body);
       setError("Messaggio non inviato. Controlla la connessione e riprova.");
@@ -107,6 +111,28 @@ export default function Home() {
       inputRef.current?.focus();
     }
   }
+
+  function pickFile(file?: File) {
+    if (!file) return;
+    if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) {
+      setError("Puoi allegare immagini o video.");
+      return;
+    }
+    if (file.size > 2.5 * 1024 * 1024) {
+      setError("Il file è troppo grande. Il limite è 2,5 MB.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setAttachment({ name: file.name, type: file.type, data: reader.result });
+        setError("");
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  const mediaUrl = (messageId: string) => `/api/messages?room=${encodeURIComponent(roomId)}&session=${encodeURIComponent(sessionId)}&nickname=${encodeURIComponent(nickname)}&attachmentId=${encodeURIComponent(messageId)}`;
 
   async function copyLink() {
     await navigator.clipboard.writeText(window.location.href);
@@ -133,7 +159,6 @@ export default function Home() {
           <form className="join-form" onSubmit={join}>
             <label htmlFor="nickname">SCEGLI IL TUO NICKNAME</label>
             <div className="join-field"><span className="at-sign">@</span><input id="nickname" value={draftName} onChange={(e) => setDraftName(e.target.value)} maxLength={24} placeholder="Il tuo nickname" autoComplete="nickname" autoFocus /><button type="submit" aria-label="Entra nella chat"><ArrowUp size={18} /></button></div>
-            <div className="nickname-shortcuts"><button type="button" onClick={() => setDraftName("ale0095")}>ale0095</button><button type="button" onClick={() => setDraftName("silvia0088")}>silvia0088</button></div>
             <span className="join-hint"><LockKeyhole size={12} /> Il tuo nome resta solo su questo dispositivo.</span>
           </form>
           <div className="entry-foot"><span className="foot-avatars"><i>A</i><i>M</i></span><span>Un invito, due persone,<br /><strong>una conversazione alla volta.</strong></span></div>
@@ -173,7 +198,7 @@ export default function Home() {
               const newSender = !previous || previous.nickname !== message.nickname;
               return <div key={message.id} className={`message-row ${mine ? "mine" : "theirs"} ${newSender ? "new-sender" : ""}`}>
                 {!mine && newSender && <span className="message-avatar" style={{ background: colors[message.nickname.charCodeAt(0) % colors.length] }}>{initials(message.nickname)}</span>}
-                <div className="message-content">{newSender && <div className="message-meta"><strong>{mine ? "Tu" : message.nickname}</strong><span>{formatTime(message.createdAt)}</span></div>}<div className="message-bubble">{message.body}</div></div>
+                <div className="message-content">{newSender && <div className="message-meta"><strong>{mine ? "Tu" : message.nickname}</strong><span>{formatTime(message.createdAt)}</span></div>}{message.body && <div className="message-bubble">{message.body}</div>}{message.attachment && (message.attachment.type.startsWith("video/") ? <video className="message-media" src={mediaUrl(message.id)} controls preload="metadata" /> : <a href={mediaUrl(message.id)} target="_blank" rel="noreferrer"><img className="message-media" src={mediaUrl(message.id)} alt={message.attachment.name} loading="lazy" /></a>)}</div>
                 {mine && newSender && <span className="message-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span>}
               </div>;
             })}
@@ -181,7 +206,7 @@ export default function Home() {
             <div ref={endRef} />
           </div>
         </div>
-        <footer className="composer-area"><form className="composer" onSubmit={send}><button type="button" className="attach-button" aria-label="Allega un file" title="Allegati non ancora disponibili"><Paperclip size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={!draft.trim() || sending} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form><div className="composer-caption"><span><LockKeyhole size={11} /> Questo spazio è vostro.</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga</span></div></footer>
+        <footer className="composer-area"><form className="composer" onSubmit={send}><input ref={fileRef} type="file" accept="image/*,video/*" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><button type="button" className="attach-button" aria-label="Allega una foto o un video" title="Allega foto o video" onClick={() => fileRef.current?.click()}><Paperclip size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={(!draft.trim() && !attachment) || sending} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form>{attachment && <div className="attachment-preview"><span>{attachment.type.startsWith("video/") ? "Video" : "Immagine"}: {attachment.name}</span><button type="button" aria-label="Rimuovi allegato" onClick={() => setAttachment(null)}><X size={14} /></button></div>}<div className="composer-caption"><span><LockKeyhole size={11} /> Questo spazio è vostro.</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga · file max 2,5 MB</span></div></footer>
       </section>
       <aside className="info-panel"><div className="info-top"><span>IL VOSTRO POSTO</span><MoreHorizontal size={18} /></div><div className="room-art"><div className="art-ring ring-one" /><div className="art-ring ring-two" /><div className="art-heart">♡</div><span className="art-star star-a">✳</span><span className="art-star star-b">·</span><span className="art-star star-c">✳</span></div><div className="room-info"><span className="room-label">QUESTA CHAT</span><h2>Il salotto</h2><p>Un posto tranquillo per dirsi le cose con calma.</p><button className="info-invite" onClick={copyLink}><Users size={15} /> {copied ? "Invito copiato" : "Invita una persona"}<ArrowDown size={13} /></button></div><div className="info-divider" /><div className="people-heading"><span>QUI DENTRO</span><span className="people-count">{onlineCount}/2</span></div><div className="people-list"><div className="person"><span className="person-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span><span>{nickname}<small>sei tu</small></span><i className="person-online" /></div>{onlineCount > 1 && <div className="person"><span className="person-avatar person-guest">+</span><span>Qualcuno di caro<small>qui con te</small></span><i className="person-online" /></div>}</div><button className="leave-link" onClick={leave}>Esci da questo spazio <ArrowLeft size={13} /></button><div className="info-footer"><span>DUETTO<span className="brand-period">.</span></span><span>POCO, MA BENE.</span></div></aside>
     </main>
