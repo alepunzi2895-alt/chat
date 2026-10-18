@@ -84,9 +84,9 @@ export async function GET(request: NextRequest) {
     await db.execute({ sql: "DELETE FROM participants WHERE room = ? AND last_seen < ?", args: [room, new Date(Date.now() - 60_000).toISOString()] });
     const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.room = ? ORDER BY m.created_at DESC LIMIT 200", args: [room] });
     const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null })).reverse();
-    const people = await db.execute({ sql: "SELECT COUNT(*) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
+    const people = await db.execute({ sql: "SELECT COUNT(DISTINCT nickname) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
     const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
-    return NextResponse.json({ messages, onlineCount: Number(people.rows[0]?.count ?? 1), ttlSeconds: Number(setting.rows[0]?.ttl_seconds ?? 0), serverNow: serverNow.toISOString() }, { headers: { "cache-control": "no-store" } });
+    return NextResponse.json({ messages, onlineCount: Math.min(2, Number(people.rows[0]?.count ?? 1)), ttlSeconds: Number(setting.rows[0]?.ttl_seconds ?? 0), serverNow: serverNow.toISOString() }, { headers: { "cache-control": "no-store" } });
   } catch (error) {
     console.error("Turso read error:", error);
     return NextResponse.json({ error: "Impossibile caricare i messaggi." }, { status: 503 });
