@@ -1,11 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, Camera, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Reply, Smile, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, Camera, Check, Copy, LockKeyhole, MapPin, MessageCircle, MoreHorizontal, Paperclip, Reply, Smile, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
 import { displayNickname, normalizeNickname } from "@/lib/nicknames";
 
 type Attachment = { name: string; type: string; data: string };
-type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string; data?: string } | null; expiresAt?: string | null; replyToId?: string | null };
+type SharedLocation = { latitude: number; longitude: number; accuracy: number };
+type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string; data?: string } | null; expiresAt?: string | null; replyToId?: string | null; location?: SharedLocation | null };
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
@@ -25,7 +26,7 @@ function toArrayBuffer(bytes: Uint8Array) {
   return buffer;
 }
 
-async function encryptMessage(key: CryptoKey, payload: { body: string; attachment: Attachment | null; replyToId: string | null }) {
+async function encryptMessage(key: CryptoKey, payload: { body: string; attachment: Attachment | null; replyToId: string | null; location: SharedLocation | null }) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(plaintext));
@@ -37,8 +38,8 @@ async function decryptMessage(key: CryptoKey, message: ChatMessage): Promise<Cha
   try {
     const [, , ivText, cipherText] = message.body.split(":");
     const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(ivText)) }, key, toArrayBuffer(base64ToBytes(cipherText)));
-    const payload = JSON.parse(new TextDecoder().decode(plaintext)) as { body: string; attachment: Attachment | null; replyToId?: string | null };
-    return { ...message, body: payload.body, attachment: payload.attachment, replyToId: payload.replyToId ?? null };
+    const payload = JSON.parse(new TextDecoder().decode(plaintext)) as { body: string; attachment: Attachment | null; replyToId?: string | null; location?: SharedLocation | null };
+    return { ...message, body: payload.body, attachment: payload.attachment, replyToId: payload.replyToId ?? null, location: payload.location ?? null };
   } catch {
     return { ...message, body: "Messaggio cifrato: apri il link d’invito aggiornato per leggerlo.", attachment: null };
   }
@@ -63,6 +64,7 @@ export default function Home() {
   const [replyToId, setReplyToId] = useState<string | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [attachment, setAttachment] = useState<Attachment | null>(null);
+  const [sharedLocation, setSharedLocation] = useState<SharedLocation | null>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -77,9 +79,10 @@ export default function Home() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
+  const locationRef = useRef<SharedLocation | null>(null);
   const messageFetchId = useRef(0);
   const shouldAutoScroll = useRef(true);
-  const pendingMessage = useRef<{ id: string; body: string; attachmentData: string | null; replyToId: string | null; encryptedBody: string | null } | null>(null);
+  const pendingMessage = useRef<{ id: string; body: string; attachmentData: string | null; replyToId: string | null; location: SharedLocation | null; encryptedBody: string | null } | null>(null);
   const effectiveNow = clockTick - serverTimeOffsetMs;
   const visibleMessages = messages.filter((message) => !message.expiresAt || Date.parse(message.expiresAt) > effectiveNow);
   const replyTarget = replyToId ? visibleMessages.find((message) => message.id === replyToId) ?? null : null;
@@ -208,19 +211,20 @@ export default function Home() {
   async function send(event: FormEvent) {
     event.preventDefault();
     const body = draft.trim();
-    if ((!body && !attachment) || sending) return;
+    if ((!body && !attachment && !sharedLocation) || sending) return;
     const attachmentBeingSent = attachment;
     const attachmentData = attachmentBeingSent?.data ?? null;
+    const locationBeingSent = sharedLocation;
     const replyToBeingSent = replyTarget?.id ?? null;
-    if (!pendingMessage.current || pendingMessage.current.body !== body || pendingMessage.current.attachmentData !== attachmentData || pendingMessage.current.replyToId !== replyToBeingSent) {
-      pendingMessage.current = { id: crypto.randomUUID(), body, attachmentData, replyToId: replyToBeingSent, encryptedBody: null };
+    if (!pendingMessage.current || pendingMessage.current.body !== body || pendingMessage.current.attachmentData !== attachmentData || pendingMessage.current.replyToId !== replyToBeingSent || JSON.stringify(pendingMessage.current.location) !== JSON.stringify(locationBeingSent)) {
+      pendingMessage.current = { id: crypto.randomUUID(), body, attachmentData, replyToId: replyToBeingSent, location: locationBeingSent, encryptedBody: null };
     }
     const messageId = pendingMessage.current.id;
     setSending(true);
     setError("");
     try {
       if (!roomKey) throw new Error("La cifratura non è pronta. Riprova tra un momento.");
-      pendingMessage.current.encryptedBody ??= await encryptMessage(roomKey, { body, attachment: attachmentBeingSent, replyToId: replyToBeingSent });
+      pendingMessage.current.encryptedBody ??= await encryptMessage(roomKey, { body, attachment: attachmentBeingSent, replyToId: replyToBeingSent, location: locationBeingSent });
       const encryptedBody = pendingMessage.current.encryptedBody;
       const response = await fetch("/api/messages", {
         method: "POST",
@@ -243,6 +247,7 @@ export default function Home() {
         if (inputRef.current) inputRef.current.style.height = "auto";
       }
       if (attachment === attachmentBeingSent) setAttachment(null);
+      if (locationRef.current === locationBeingSent) { locationRef.current = null; setSharedLocation(null); }
       if (replyToId === replyToBeingSent) setReplyToId(null);
       await fetchMessages();
     } catch (sendError) {
@@ -292,6 +297,23 @@ export default function Home() {
       }
     };
     reader.readAsDataURL(file);
+  }
+
+  function shareCurrentLocation() {
+    if (!navigator.geolocation) {
+      setError("La posizione non è supportata da questo browser.");
+      return;
+    }
+    setError("");
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        const location = { latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy };
+        locationRef.current = location;
+        setSharedLocation(location);
+      },
+      (locationError) => setError(locationError.code === locationError.PERMISSION_DENIED ? "Permesso di posizione negato. Puoi abilitarlo nelle impostazioni del browser." : "Non riesco a ottenere la posizione. Riprova."),
+      { enableHighAccuracy: true, timeout: 15_000, maximumAge: 0 },
+    );
   }
 
   const mediaUrl = (message: ChatMessage) => message.attachment?.data ?? `/api/messages?room=${encodeURIComponent(roomId)}&session=${encodeURIComponent(sessionId)}&nickname=${encodeURIComponent(nickname)}&attachmentId=${encodeURIComponent(message.id)}`;
@@ -401,14 +423,14 @@ export default function Home() {
               const timerLabel = message.expiresAt ? `Messaggio con timer, scade alle ${formatTime(message.expiresAt)}` : "";
               return <div key={message.id} id={`message-${message.id}`} className={`message-row ${mine ? "mine" : "theirs"} ${newSender ? "new-sender" : ""}`}>
                 {!mine && newSender && <span className="message-avatar" style={{ background: colors[message.nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(message.nickname, nickname))}</span>}
-                <div className="message-content">{newSender && <div className="message-meta"><strong>{displayNickname(message.nickname, nickname)}</strong><span>{formatTime(message.createdAt)}</span></div>}{message.replyToId && <button type="button" className="reply-quote" disabled={!repliedMessage} onClick={() => repliedMessage && scrollToMessage(repliedMessage.id)}><strong>{repliedMessage ? displayNickname(repliedMessage.nickname, nickname) : "Risposta"}</strong><span>{repliedMessage ? (repliedMessage.body || (repliedMessage.attachment?.type.startsWith("video/") ? "Video" : "Immagine")).slice(0, 90) : "Messaggio non più disponibile"}</span></button>}{message.body && <div className="message-bubble">{message.body}{timerLabel && <span className="message-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}</div>}{message.attachment && (message.attachment.type.startsWith("video/") ? <video className="message-media" src={mediaUrl(message)} controls preload="metadata" /> : <a href={mediaUrl(message)} target="_blank" rel="noreferrer"><img className="message-media" src={mediaUrl(message)} alt={message.attachment.name} loading="lazy" /></a>)}{timerLabel && !message.body && <span className="message-timer-marker attachment-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}<div className="message-actions"><button type="button" className="message-reply-button" onClick={() => { setReplyToId(message.id); setShowEmojiPicker(false); inputRef.current?.focus(); }} aria-label={`Rispondi al messaggio di ${displayNickname(message.nickname, nickname)}`}><Reply size={13} /> Rispondi</button></div></div>
+                <div className="message-content">{newSender && <div className="message-meta"><strong>{displayNickname(message.nickname, nickname)}</strong><span>{formatTime(message.createdAt)}</span></div>}{message.replyToId && <button type="button" className="reply-quote" disabled={!repliedMessage} onClick={() => repliedMessage && scrollToMessage(repliedMessage.id)}><strong>{repliedMessage ? displayNickname(repliedMessage.nickname, nickname) : "Risposta"}</strong><span>{repliedMessage ? (repliedMessage.body || (repliedMessage.location ? "Posizione" : repliedMessage.attachment?.type.startsWith("video/") ? "Video" : "Immagine")).slice(0, 90) : "Messaggio non più disponibile"}</span></button>}{message.body && <div className="message-bubble">{message.body}{timerLabel && <span className="message-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}</div>}{message.location && <a className="location-message" href={`https://maps.google.com/?q=${message.location.latitude},${message.location.longitude}`} target="_blank" rel="noreferrer"><MapPin size={17} /><span><strong>Posizione condivisa</strong><small>Precisione circa {Math.max(1, Math.round(message.location.accuracy))} m · Apri mappa</small></span></a>}{message.attachment && (message.attachment.type.startsWith("video/") ? <video className="message-media" src={mediaUrl(message)} controls preload="metadata" /> : <a href={mediaUrl(message)} target="_blank" rel="noreferrer"><img className="message-media" src={mediaUrl(message)} alt={message.attachment.name} loading="lazy" /></a>)}{timerLabel && !message.body && <span className="message-timer-marker attachment-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}<div className="message-actions"><button type="button" className="message-reply-button" onClick={() => { setReplyToId(message.id); setShowEmojiPicker(false); inputRef.current?.focus(); }} aria-label={`Rispondi al messaggio di ${displayNickname(message.nickname, nickname)}`}><Reply size={13} /> Rispondi</button></div></div>
                 {mine && newSender && <span className="message-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(nickname, nickname))}</span>}
               </div>;
             })}
             {error && <div className="error-note">{error}</div>}
           </div>
         </div>
-        <footer className="composer-area">{showEmojiPicker && <div className="emoji-picker" role="dialog" aria-label="Emoticon classiche">{classicEmojis.map((emoji) => <button key={emoji} type="button" aria-label={`Inserisci ${emoji}`} onMouseDown={(event) => event.preventDefault()} onClick={() => insertEmoji(emoji)}>{emoji}</button>)}</div>}{replyTarget && <div className="reply-composer-preview"><span><strong>Rispondi a {displayNickname(replyTarget.nickname, nickname)}</strong><small>{(replyTarget.body || (replyTarget.attachment?.type.startsWith("video/") ? "Video" : "Immagine")).slice(0, 100)}</small></span><button type="button" aria-label="Annulla risposta" onClick={() => setReplyToId(null)}><X size={15} /></button></div>}<form className="composer" onSubmit={send}><input ref={fileRef} type="file" accept="image/*,video/*" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><button type="button" className="attach-button" aria-label="Scatta una foto" title="Scatta una foto" onClick={() => cameraRef.current?.click()}><Camera size={17} /></button><button type="button" className="attach-button" aria-label="Allega una foto o un video" title="Allega foto o video" onClick={() => fileRef.current?.click()}><Paperclip size={17} /></button><button type="button" className={`attach-button emoji-toggle ${showEmojiPicker ? "selected" : ""}`} aria-label="Apri emoticon" aria-expanded={showEmojiPicker} onClick={() => setShowEmojiPicker((open) => !open)}><Smile size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={(!draft.trim() && !attachment) || sending || !keyReady} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form>{attachment && <div className="attachment-preview"><span>{attachment.type.startsWith("video/") ? "Video" : "Immagine"}: {attachment.name}</span><button type="button" aria-label="Rimuovi allegato" onClick={() => setAttachment(null)}><X size={14} /></button></div>}<div className="composer-caption"><span><LockKeyhole size={11} /> {roomKey ? "Cifratura end-to-end attiva" : "Cifratura non disponibile"}</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga · file max 2 MB</span></div></footer>
+        <footer className="composer-area">{showEmojiPicker && <div className="emoji-picker" role="dialog" aria-label="Emoticon classiche">{classicEmojis.map((emoji) => <button key={emoji} type="button" aria-label={`Inserisci ${emoji}`} onMouseDown={(event) => event.preventDefault()} onClick={() => insertEmoji(emoji)}>{emoji}</button>)}</div>}{replyTarget && <div className="reply-composer-preview"><span><strong>Rispondi a {displayNickname(replyTarget.nickname, nickname)}</strong><small>{(replyTarget.body || (replyTarget.location ? "Posizione" : replyTarget.attachment?.type.startsWith("video/") ? "Video" : "Immagine")).slice(0, 100)}</small></span><button type="button" aria-label="Annulla risposta" onClick={() => setReplyToId(null)}><X size={15} /></button></div>}<form className="composer" onSubmit={send}><input ref={fileRef} type="file" accept="image/*,video/*" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><button type="button" className="attach-button" aria-label="Scatta una foto" title="Scatta una foto" onClick={() => cameraRef.current?.click()}><Camera size={17} /></button><button type="button" className="attach-button" aria-label="Allega una foto o un video" title="Allega foto o video" onClick={() => fileRef.current?.click()}><Paperclip size={17} /></button><button type="button" className="attach-button" aria-label="Condividi la posizione attuale" title="Condividi posizione" onClick={shareCurrentLocation}><MapPin size={17} /></button><button type="button" className={`attach-button emoji-toggle ${showEmojiPicker ? "selected" : ""}`} aria-label="Apri emoticon" aria-expanded={showEmojiPicker} onClick={() => setShowEmojiPicker((open) => !open)}><Smile size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={(!draft.trim() && !attachment && !sharedLocation) || sending || !keyReady} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form>{attachment && <div className="attachment-preview"><span>{attachment.type.startsWith("video/") ? "Video" : "Immagine"}: {attachment.name}</span><button type="button" aria-label="Rimuovi allegato" onClick={() => setAttachment(null)}><X size={14} /></button></div>}{sharedLocation && <div className="attachment-preview"><span><MapPin size={13} /> Posizione pronta · precisione circa {Math.max(1, Math.round(sharedLocation.accuracy))} m</span><button type="button" aria-label="Rimuovi posizione" onClick={() => { locationRef.current = null; setSharedLocation(null); }}><X size={14} /></button></div>}<div className="composer-caption"><span><LockKeyhole size={11} /> {roomKey ? "Cifratura end-to-end attiva" : "Cifratura non disponibile"}</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga · file max 2 MB</span></div></footer>
       </section>
       <aside className="info-panel"><div className="info-top"><span>IL VOSTRO POSTO</span><MoreHorizontal size={18} /></div><div className="room-art"><div className="art-ring ring-one" /><div className="art-ring ring-two" /><div className="art-heart">♡</div><span className="art-star star-a">✳</span><span className="art-star star-b">·</span><span className="art-star star-c">✳</span></div><div className="room-info"><span className="room-label">QUESTA CHAT</span><h2>Il salotto</h2><p>Un posto tranquillo per dirsi le cose con calma.</p><button className="info-invite" onClick={copyLink}><Users size={15} /> {copied ? "Invito copiato" : "Invita una persona"}<ArrowDown size={13} /></button></div><div className="info-divider" /><div className="people-heading"><span>QUI DENTRO</span><span className="people-count">{onlineCount}/2</span></div><div className="people-list"><div className="person"><span className="person-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(nickname, nickname))}</span><span>{displayNickname(nickname, nickname)}<small>sei tu</small></span><i className="person-online" /></div>{onlineCount > 1 && <div className="person"><span className="person-avatar person-guest">+</span><span>amoretuo<small>qui con te</small></span><i className="person-online" /></div>}</div><button className="leave-link" onClick={leave}>Esci da questo spazio <ArrowLeft size={13} /></button><div className="info-footer"><span>TACCUINO<span className="brand-period">.</span></span><span>POCO, MA BENE.</span></div></aside>
     </main>

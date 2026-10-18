@@ -6,3 +6,4 @@ html,body{background:#111311;color:#e9e7df;color-scheme:dark}.entry-page{backgro
 
 .message-timer-marker{color:#b7c6aa}
 .message-reply-button{color:#9a9d92}.message-reply-button:hover{color:#c2d1b5}.reply-quote{background:#252a24;color:#b9baaf}.reply-quote strong,.reply-composer-preview strong{color:#b5c5a7}.reply-composer-preview{background:#222720;border-color:#899a85;color:#b9baaf}.reply-composer-preview button{color:#a3a69a}.emoji-picker{border-color:#3b4038;background:#20231f;box-shadow:0 10px 30px #0008}.emoji-picker button:hover{background:#30362e}.emoji-toggle.selected,.emoji-toggle:hover{color:#c0cfb4}
+.location-message{background:#242a23;border-color:#3b4438;color:#b6c8ac}.location-message small{color:#a0a196}
