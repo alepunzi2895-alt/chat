@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowDown, ArrowLeft, ArrowUp, Camera, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
+import { displayNickname, normalizeNickname } from "@/lib/nicknames";
 
 type Attachment = { name: string; type: string; data: string };
 type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string; data?: string } | null; expiresAt?: string | null };
@@ -45,8 +46,6 @@ async function decryptMessage(key: CryptoKey, message: ChatMessage): Promise<Cha
 
 const colors = ["#f0a978", "#9f9ee8", "#72b8aa", "#db88a1"];
 const initials = (name: string) => name.trim().slice(0, 1).toUpperCase();
-const displayNickname = (name: string, ownNickname: string) => name === ownNickname ? "amoremio" : "amoretuo";
-
 function formatTime(value: string) {
   return new Intl.DateTimeFormat("it-IT", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
 }
@@ -365,7 +364,7 @@ export default function Home() {
             {visibleMessages.length > 0 && <div className="history-divider"><span>LA VOSTRA CONVERSAZIONE</span></div>}
             {loading && visibleMessages.length === 0 && <div className="loading-note"><span className="loader" /> Sto preparando il salotto...</div>}
             {visibleMessages.map((message, index) => {
-              const mine = message.nickname === nickname;
+              const mine = normalizeNickname(message.nickname) === normalizeNickname(nickname);
               const previous = visibleMessages[index - 1];
               const newSender = !previous || previous.nickname !== message.nickname;
               const timerLabel = message.expiresAt ? `Messaggio con timer, scade alle ${formatTime(message.expiresAt)}` : "";

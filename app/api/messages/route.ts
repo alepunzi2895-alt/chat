@@ -1,5 +1,6 @@
 import { createClient } from "@libsql/client/web";
 import { NextRequest, NextResponse } from "next/server";
+import { normalizeNickname } from "@/lib/nicknames";
 
 export const runtime = "edge";
 
@@ -57,6 +58,7 @@ export async function GET(request: NextRequest) {
   const session = request.nextUrl.searchParams.get("session");
   const nickname = request.nextUrl.searchParams.get("nickname")?.trim();
   if (!validRoom(room) || !session || !/^[\da-f-]{36}$/i.test(session) || !nickname || nickname.length > 24) return NextResponse.json({ error: "Stanza o nickname non validi." }, { status: 400 });
+  const storedNickname = normalizeNickname(nickname);
   try {
     const { db, ready } = database();
     await ready;
@@ -77,7 +79,7 @@ export async function GET(request: NextRequest) {
     const lastSeen = new Date().toISOString();
     await db.execute({
       sql: "INSERT INTO participants (room, session_id, nickname, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(room, session_id) DO UPDATE SET nickname = excluded.nickname, last_seen = excluded.last_seen",
-      args: [room, session, nickname, lastSeen],
+      args: [room, session, storedNickname, lastSeen],
     });
     await db.execute({ sql: "DELETE FROM participants WHERE room = ? AND last_seen < ?", args: [room, new Date(Date.now() - 60_000).toISOString()] });
     const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.room = ? ORDER BY m.created_at DESC LIMIT 200", args: [room] });
@@ -106,6 +108,7 @@ export async function POST(request: NextRequest) {
   if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || typeof body !== "string" || !validBody || hasAttachment || !validAttachment || !validClientMessageId) {
     return NextResponse.json({ error: "Nickname o messaggio non valido." }, { status: 400 });
   }
+  const storedNickname = normalizeNickname(nickname.trim());
   const id = typeof clientMessageId === "string" ? clientMessageId : crypto.randomUUID();
   try {
     const { db, ready } = database();
@@ -113,7 +116,7 @@ export async function POST(request: NextRequest) {
     const existing = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
     const existingRow = existing.rows[0];
     if (existingRow) {
-      if (String(existingRow.room) !== room || String(existingRow.nickname) !== nickname.trim() || String(existingRow.body) !== body.trim()) {
+      if (String(existingRow.room) !== room || String(existingRow.nickname) !== storedNickname || String(existingRow.body) !== body.trim()) {
         return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
       }
       return NextResponse.json({ message: { id: String(existingRow.id), nickname: String(existingRow.nickname), body: String(existingRow.body), createdAt: String(existingRow.created_at), attachment: existingRow.attachment_type ? { name: String(existingRow.attachment_name), type: String(existingRow.attachment_type) } : null, expiresAt: existingRow.expires_at ? String(existingRow.expires_at) : null } }, { status: 201 });
@@ -123,14 +126,14 @@ export async function POST(request: NextRequest) {
     const createdAt = new Date().toISOString();
     const expiresAt = ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null;
     const statements: Array<{ sql: string; args: (string | number | null)[] }> = [
-      { sql: "INSERT OR IGNORE INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, nickname.trim(), body.trim(), createdAt] },
+      { sql: "INSERT OR IGNORE INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, storedNickname, body.trim(), createdAt] },
     ];
     if (file) statements.push({ sql: "INSERT OR IGNORE INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, encoded] });
     if (expiresAt) statements.push({ sql: "INSERT OR IGNORE INTO message_expiry (message_id, room, expires_at) VALUES (?, ?, ?)", args: [id, room, expiresAt] });
     await db.batch(statements, "write");
     const saved = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
     const row = saved.rows[0];
-    if (!row || String(row.room) !== room || String(row.nickname) !== nickname.trim() || String(row.body) !== body.trim()) {
+    if (!row || String(row.room) !== room || String(row.nickname) !== storedNickname || String(row.body) !== body.trim()) {
       return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
     }
     return NextResponse.json({ message: { id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null } }, { status: 201 });
