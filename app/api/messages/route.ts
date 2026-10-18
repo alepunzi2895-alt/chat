@@ -79,8 +79,8 @@ export async function GET(request: NextRequest) {
       args: [room, session, nickname, lastSeen],
     });
     await db.execute({ sql: "DELETE FROM participants WHERE room = ? AND last_seen < ?", args: [room, new Date(Date.now() - 60_000).toISOString()] });
-    const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room WHERE m.room = ? ORDER BY m.created_at ASC LIMIT 200", args: [room] });
-    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null }));
+    const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.room = ? ORDER BY m.created_at DESC LIMIT 200", args: [room] });
+    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null })).reverse();
     const people = await db.execute({ sql: "SELECT COUNT(*) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
     const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
     return NextResponse.json({ messages, onlineCount: Number(people.rows[0]?.count ?? 1), ttlSeconds: Number(setting.rows[0]?.ttl_seconds ?? 0) }, { headers: { "cache-control": "no-store" } });
@@ -94,28 +94,45 @@ export async function POST(request: NextRequest) {
   let payload: unknown;
   try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
   if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
-  const { room, nickname, body, attachment } = payload as Record<string, unknown>;
+  const { room, nickname, body, attachment, clientMessageId } = payload as Record<string, unknown>;
   const hasAttachment = attachment !== undefined && attachment !== null;
   const file = hasAttachment && typeof attachment === "object" ? attachment as Record<string, unknown> : null;
   const data = typeof file?.data === "string" ? file.data : "";
   const encoded = data.split(",", 2)[1] ?? "";
   const validAttachment = !hasAttachment || (!!file && typeof file.name === "string" && file.name.length <= 180 && typeof file.type === "string" && (/^image\/(jpeg|png|gif|webp|avif)$/.test(file.type) || /^video\/(mp4|webm|quicktime)$/.test(file.type)) && data.startsWith(`data:${file.type};base64,`) && encoded.length <= 3_500_000 && /^[A-Za-z0-9+/]*={0,2}$/.test(encoded));
-  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || typeof body !== "string" || body.length > 2000 || (!body.trim() && !hasAttachment) || !validAttachment) {
+  const validClientMessageId = clientMessageId === undefined || (typeof clientMessageId === "string" && /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(clientMessageId));
+  const validBody = typeof body === "string" && body.length <= 4_200_000 && /^e2ee:v1:[A-Za-z0-9+/]{16}={0,2}:[A-Za-z0-9+/]+={0,2}$/.test(body);
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || typeof body !== "string" || !validBody || hasAttachment || !validAttachment || !validClientMessageId) {
     return NextResponse.json({ error: "Nickname o messaggio non valido." }, { status: 400 });
   }
-  const id = crypto.randomUUID();
-  const createdAt = new Date().toISOString();
+  const id = typeof clientMessageId === "string" ? clientMessageId : crypto.randomUUID();
   try {
     const { db, ready } = database();
     await ready;
-    await db.execute({ sql: "INSERT INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, nickname.trim(), body.trim(), createdAt] });
-    if (file) await db.execute({ sql: "INSERT INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, (file.data as string).split(",", 2)[1]] });
+    const existing = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
+    const existingRow = existing.rows[0];
+    if (existingRow) {
+      if (String(existingRow.room) !== room || String(existingRow.nickname) !== nickname.trim() || String(existingRow.body) !== body.trim()) {
+        return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
+      }
+      return NextResponse.json({ message: { id: String(existingRow.id), nickname: String(existingRow.nickname), body: String(existingRow.body), createdAt: String(existingRow.created_at), attachment: existingRow.attachment_type ? { name: String(existingRow.attachment_name), type: String(existingRow.attachment_type) } : null, expiresAt: existingRow.expires_at ? String(existingRow.expires_at) : null } }, { status: 201 });
+    }
     const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
     const ttlSeconds = Number(setting.rows[0]?.ttl_seconds ?? 0);
-    if (ttlSeconds > 0) {
-      await db.execute({ sql: "INSERT INTO message_expiry (message_id, room, expires_at) VALUES (?, ?, ?)", args: [id, room, new Date(Date.now() + ttlSeconds * 1000).toISOString()] });
+    const createdAt = new Date().toISOString();
+    const expiresAt = ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null;
+    const statements: Array<{ sql: string; args: (string | number | null)[] }> = [
+      { sql: "INSERT OR IGNORE INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, nickname.trim(), body.trim(), createdAt] },
+    ];
+    if (file) statements.push({ sql: "INSERT OR IGNORE INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, encoded] });
+    if (expiresAt) statements.push({ sql: "INSERT OR IGNORE INTO message_expiry (message_id, room, expires_at) VALUES (?, ?, ?)", args: [id, room, expiresAt] });
+    await db.batch(statements, "write");
+    const saved = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
+    const row = saved.rows[0];
+    if (!row || String(row.room) !== room || String(row.nickname) !== nickname.trim() || String(row.body) !== body.trim()) {
+      return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
     }
-    return NextResponse.json({ message: { id, nickname: nickname.trim(), body: body.trim(), createdAt } }, { status: 201 });
+    return NextResponse.json({ message: { id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null } }, { status: 201 });
   } catch (error) {
     console.error("Turso write error:", error);
     return NextResponse.json({ error: "Impossibile salvare il messaggio." }, { status: 503 });
@@ -127,7 +144,7 @@ export async function PATCH(request: NextRequest) {
   try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
   if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
   const { room, nickname, ttlSeconds } = payload as Record<string, unknown>;
-  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || ![0, 3600, 86400, 604800].includes(Number(ttlSeconds))) {
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || ![0, 300, 900, 1800, 3600, 86400, 604800].includes(Number(ttlSeconds))) {
     return NextResponse.json({ error: "Impostazioni non valide." }, { status: 400 });
   }
   try {

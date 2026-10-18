@@ -1,13 +1,51 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, Camera, Check, Copy, LockKeyhole, MessageCircle, MoreHorizontal, Paperclip, Sparkles, Users, X, Trash2, Timer } from "lucide-react";
 
 type Attachment = { name: string; type: string; data: string };
-type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string } | null };
+type ChatMessage = { id: string; nickname: string; body: string; createdAt: string; attachment?: { name: string; type: string; data?: string } | null; expiresAt?: string | null };
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+function toArrayBuffer(bytes: Uint8Array) {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+async function encryptMessage(key: CryptoKey, payload: { body: string; attachment: Attachment | null }) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(plaintext));
+  return `e2ee:v1:${bytesToBase64(iv)}:${bytesToBase64(new Uint8Array(encrypted))}`;
+}
+
+async function decryptMessage(key: CryptoKey, message: ChatMessage): Promise<ChatMessage> {
+  if (!message.body.startsWith("e2ee:v1:")) return message;
+  try {
+    const [, , ivText, cipherText] = message.body.split(":");
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(base64ToBytes(ivText)) }, key, toArrayBuffer(base64ToBytes(cipherText)));
+    const payload = JSON.parse(new TextDecoder().decode(plaintext)) as { body: string; attachment: Attachment | null };
+    return { ...message, body: payload.body, attachment: payload.attachment };
+  } catch {
+    return { ...message, body: "Messaggio cifrato: apri il link d’invito aggiornato per leggerlo.", attachment: null };
+  }
+}
 
 const colors = ["#f0a978", "#9f9ee8", "#72b8aa", "#db88a1"];
 const initials = (name: string) => name.trim().slice(0, 1).toUpperCase();
+const displayNickname = (name: string, ownNickname: string) => name === ownNickname ? "amoremio" : "amoretuo";
 
 function formatTime(value: string) {
   return new Intl.DateTimeFormat("it-IT", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
@@ -16,6 +54,8 @@ function formatTime(value: string) {
 export default function Home() {
   const [nickname, setNickname] = useState("");
   const [roomId, setRoomId] = useState("");
+  const [roomKey, setRoomKey] = useState<CryptoKey | null>(null);
+  const [keyReady, setKeyReady] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [draftName, setDraftName] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -29,9 +69,13 @@ export default function Home() {
   const [ttlSeconds, setTtlSeconds] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
+  const messageFetchId = useRef(0);
+  const shouldAutoScroll = useRef(true);
+  const pendingMessage = useRef<{ id: string; body: string; attachmentData: string | null; encryptedBody: string | null } | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -46,6 +90,25 @@ export default function Home() {
       window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
     }
     setRoomId(room);
+    void (async () => {
+      try {
+        const match = window.location.hash.match(/(?:^#|&)key=([A-Za-z0-9_-]{43})/);
+        let keyBytes: Uint8Array;
+        if (match) {
+          const raw = match[1].replace(/-/g, "+").replace(/_/g, "/");
+          keyBytes = base64ToBytes(raw + "=");
+        } else {
+          keyBytes = crypto.getRandomValues(new Uint8Array(32));
+          const encoded = bytesToBase64(keyBytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+          window.history.replaceState({}, "", `${window.location.pathname}${window.location.search}#key=${encoded}`);
+        }
+        setRoomKey(await crypto.subtle.importKey("raw", toArrayBuffer(keyBytes), "AES-GCM", false, ["encrypt", "decrypt"]));
+      } catch {
+        setError("Non riesco a inizializzare la cifratura su questo browser.");
+      } finally {
+        setKeyReady(true);
+      }
+    })();
     const session = window.localStorage.getItem("duetto-session") ?? crypto.randomUUID();
     window.localStorage.setItem("duetto-session", session);
     setSessionId(session);
@@ -53,23 +116,47 @@ export default function Home() {
     if (saved) setNickname(saved);
   }, []);
 
+  useEffect(() => {
+    const syncKeyFromInvite = () => {
+      const match = window.location.hash.match(/(?:^#|&)key=([A-Za-z0-9_-]{43})/);
+      if (!match) return;
+      try {
+        const raw = match[1].replace(/-/g, "+").replace(/_/g, "/");
+        pendingMessage.current = null;
+        setKeyReady(false);
+        void crypto.subtle.importKey("raw", toArrayBuffer(base64ToBytes(raw + "=")), "AES-GCM", false, ["encrypt", "decrypt"])
+          .then((key) => { setRoomKey(key); setKeyReady(true); })
+          .catch(() => { setRoomKey(null); setKeyReady(true); setError("Il link d’invito contiene una chiave non valida."); });
+      } catch {
+        setError("Il link d’invito contiene una chiave non valida.");
+      }
+    };
+    window.addEventListener("hashchange", syncKeyFromInvite);
+    return () => window.removeEventListener("hashchange", syncKeyFromInvite);
+  }, []);
+
   const fetchMessages = useCallback(async () => {
     if (!nickname || !roomId || !sessionId) return;
+    const fetchId = ++messageFetchId.current;
     try {
       const params = new URLSearchParams({ room: roomId, session: sessionId, nickname });
       const response = await fetch(`/api/messages?${params.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Connessione al server non riuscita.");
       const data = await response.json() as { messages: ChatMessage[]; onlineCount?: number; ttlSeconds?: number };
-      setMessages(data.messages);
+      if (fetchId !== messageFetchId.current) return;
+      const decryptedMessages = await Promise.all(data.messages.map((message) => roomKey ? decryptMessage(roomKey, message) : message));
+      if (fetchId !== messageFetchId.current) return;
+      setMessages(decryptedMessages);
       setOnlineCount(data.onlineCount ?? 1);
       setTtlSeconds(data.ttlSeconds ?? 0);
       setError("");
     } catch {
+      if (fetchId !== messageFetchId.current) return;
       setError("Non riesco a raggiungere la chat. Riprovo tra poco.");
     } finally {
-      setLoading(false);
+      if (fetchId === messageFetchId.current) setLoading(false);
     }
-  }, [nickname, roomId, sessionId]);
+  }, [nickname, roomId, sessionId, roomKey]);
 
   useEffect(() => {
     if (!nickname || !roomId || !sessionId) return;
@@ -80,7 +167,10 @@ export default function Home() {
   }, [nickname, roomId, sessionId, fetchMessages]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    const conversation = conversationRef.current;
+    if (shouldAutoScroll.current && conversation) {
+      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
+    }
   }, [messages]);
 
   function join(event: FormEvent) {
@@ -95,21 +185,42 @@ export default function Home() {
     event.preventDefault();
     const body = draft.trim();
     if ((!body && !attachment) || sending) return;
+    const attachmentBeingSent = attachment;
+    const attachmentData = attachmentBeingSent?.data ?? null;
+    if (!pendingMessage.current || pendingMessage.current.body !== body || pendingMessage.current.attachmentData !== attachmentData) {
+      pendingMessage.current = { id: crypto.randomUUID(), body, attachmentData, encryptedBody: null };
+    }
+    const messageId = pendingMessage.current.id;
     setSending(true);
-    setDraft("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
+    setError("");
     try {
+      if (!roomKey) throw new Error("La cifratura non è pronta. Riprova tra un momento.");
+      pendingMessage.current.encryptedBody ??= await encryptMessage(roomKey, { body, attachment: attachmentBeingSent });
+      const encryptedBody = pendingMessage.current.encryptedBody;
       const response = await fetch("/api/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ room: roomId, nickname, body, attachment }),
+        body: JSON.stringify({ room: roomId, nickname, body: encryptedBody, clientMessageId: messageId }),
       });
-      if (!response.ok) throw new Error("Messaggio non inviato.");
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null) as { error?: string } | null;
+        throw new Error(failure?.error ?? "Messaggio non inviato. Controlla la connessione e riprova.");
+      }
+      const data = await response.json() as { message: ChatMessage };
+      if (!data.message?.id) throw new Error("Il server non ha confermato il messaggio. Riprova.");
+      const clearMessage = await decryptMessage(roomKey, data.message);
+      setMessages((current) => current.some((message) => message.id === clearMessage.id)
+        ? current
+        : [...current, clearMessage].sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-200));
+      if (pendingMessage.current?.id === messageId) pendingMessage.current = null;
+      if (draft.trim() === body) {
+        setDraft("");
+        if (inputRef.current) inputRef.current.style.height = "auto";
+      }
+      if (attachment === attachmentBeingSent) setAttachment(null);
       await fetchMessages();
-      setAttachment(null);
-    } catch {
-      setDraft(body);
-      setError("Messaggio non inviato. Controlla la connessione e riprova.");
+    } catch (sendError) {
+      setError(sendError instanceof Error ? sendError.message : "Messaggio non inviato. Controlla la connessione e riprova.");
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -122,8 +233,8 @@ export default function Home() {
       setError("Puoi allegare immagini o video.");
       return;
     }
-    if (file.size > 2.5 * 1024 * 1024) {
-      setError("Il file è troppo grande. Il limite è 2,5 MB.");
+    if (file.size > 2 * 1024 * 1024) {
+      setError("Il file è troppo grande. Il limite è 2 MB.");
       return;
     }
     const reader = new FileReader();
@@ -136,7 +247,7 @@ export default function Home() {
     reader.readAsDataURL(file);
   }
 
-  const mediaUrl = (messageId: string) => `/api/messages?room=${encodeURIComponent(roomId)}&session=${encodeURIComponent(sessionId)}&nickname=${encodeURIComponent(nickname)}&attachmentId=${encodeURIComponent(messageId)}`;
+  const mediaUrl = (message: ChatMessage) => message.attachment?.data ?? `/api/messages?room=${encodeURIComponent(roomId)}&session=${encodeURIComponent(sessionId)}&nickname=${encodeURIComponent(nickname)}&attachmentId=${encodeURIComponent(message.id)}`;
 
   async function copyLink() {
     await navigator.clipboard.writeText(window.location.href);
@@ -227,11 +338,11 @@ export default function Home() {
 
   return (
     <main className="chat-page">
-      <aside className="rail"><a className="rail-brand" href="#" aria-label="Duetto"><span className="brand-mark"><MessageCircle size={17} strokeWidth={2.4} /></span></a><div className="rail-center"><div className="rail-room active"><span>♡</span><i /></div><button className="rail-add" onClick={copyLink} aria-label="Copia invito"><span>+</span></button></div><button className="rail-profile" onClick={leave} title="Esci dalla chat"><span style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span></button></aside>
+      <aside className="rail"><a className="rail-brand" href="#" aria-label="Duetto"><span className="brand-mark"><MessageCircle size={17} strokeWidth={2.4} /></span></a><div className="rail-center"><div className="rail-room active"><span>♡</span><i /></div><button className="rail-add" onClick={copyLink} aria-label="Copia invito"><span>+</span></button></div><button className="rail-profile" onClick={leave} title="Esci dalla chat"><span style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(nickname, nickname))}</span></button></aside>
       <section className="chat-shell">
         <header className="chat-header"><div className="chat-title-group"><button className="mobile-back" onClick={leave} aria-label="Esci"><ArrowLeft size={18} /></button><div className="room-symbol">♡</div><div><h1>Il salotto</h1><p><span className="live-dot" /> {onlineCount > 1 ? "Ci siete in due" : "Il tuo piccolo spazio"}</p></div></div><div className="header-actions"><button className={`invite-button ${copied ? "copied" : ""}`} onClick={copyLink}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "Link copiato" : "Invita qualcuno"}</button><button className="more-button" onClick={() => setShowSettings((value) => !value)} aria-label="Impostazioni chat" aria-expanded={showSettings}><MoreHorizontal size={19} /></button></div></header>
-        {showSettings && <div className="room-menu" role="dialog" aria-label="Impostazioni chat"><label htmlFor="message-ttl"><Timer size={14} /> Autodistruzione messaggi</label><select id="message-ttl" value={ttlSeconds} disabled={savingSettings} onChange={(event) => void changeTimer(event.target.value)}><option value={0}>Disattivata</option><option value={3600}>Dopo 1 ora</option><option value={86400}>Dopo 1 giorno</option><option value={604800}>Dopo 7 giorni</option></select><p>Il timer vale per i messaggi inviati da questo momento.</p><div className="menu-divider" /><button className="clear-chat-button" onClick={() => void clearChat()} disabled={savingSettings}><Trash2 size={14} /> {savingSettings ? "Attendi…" : "Svuota chat per entrambi"}</button></div>}
-        <div className="conversation">
+        {showSettings && <div className="room-menu" role="dialog" aria-label="Impostazioni chat"><label htmlFor="message-ttl"><Timer size={14} /> Autodistruzione messaggi</label><select id="message-ttl" value={ttlSeconds} disabled={savingSettings} onChange={(event) => void changeTimer(event.target.value)}><option value={0}>Disattivata</option><option value={300}>Dopo 5 minuti</option><option value={900}>Dopo 15 minuti</option><option value={1800}>Dopo 30 minuti</option><option value={3600}>Dopo 1 ora</option><option value={86400}>Dopo 1 giorno</option><option value={604800}>Dopo 7 giorni</option></select><p>Il timer vale per i messaggi inviati da questo momento.</p><div className="menu-divider" /><button className="clear-chat-button" onClick={() => void clearChat()} disabled={savingSettings}><Trash2 size={14} /> {savingSettings ? "Attendi…" : "Svuota chat per entrambi"}</button></div>}
+        <div className="conversation" ref={conversationRef} role="region" aria-label="Conversazione" tabIndex={0} onScroll={(event) => { const element = event.currentTarget; shouldAutoScroll.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; }}>
           <div className="conversation-inner">
             <div className="welcome-card"><div className="welcome-icon"><MessageCircle size={19} /></div><p className="welcome-kicker">BENVENUTI NEL VOSTRO SPAZIO</p><h2>Le conversazioni<br />cominciano da qui.</h2><p>Solo voi due. Nessuna fretta.</p><div className="welcome-rule"><span /></div></div>
             {messages.length > 0 && <div className="history-divider"><span>LA VOSTRA CONVERSAZIONE</span></div>}
@@ -240,19 +351,19 @@ export default function Home() {
               const mine = message.nickname === nickname;
               const previous = messages[index - 1];
               const newSender = !previous || previous.nickname !== message.nickname;
-              return <div key={message.id} className={`message-row ${mine ? "mine" : "theirs"} ${newSender ? "new-sender" : ""}`}>
-                {!mine && newSender && <span className="message-avatar" style={{ background: colors[message.nickname.charCodeAt(0) % colors.length] }}>{initials(message.nickname)}</span>}
-                <div className="message-content">{newSender && <div className="message-meta"><strong>{mine ? "Tu" : message.nickname}</strong><span>{formatTime(message.createdAt)}</span></div>}{message.body && <div className="message-bubble">{message.body}</div>}{message.attachment && (message.attachment.type.startsWith("video/") ? <video className="message-media" src={mediaUrl(message.id)} controls preload="metadata" /> : <a href={mediaUrl(message.id)} target="_blank" rel="noreferrer"><img className="message-media" src={mediaUrl(message.id)} alt={message.attachment.name} loading="lazy" /></a>)}</div>
-                {mine && newSender && <span className="message-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span>}
+              const timerLabel = message.expiresAt ? `Messaggio con timer, scade alle ${formatTime(message.expiresAt)}` : "";
+      return <div key={message.id} className={`message-row ${mine ? "mine" : "theirs"} ${newSender ? "new-sender" : ""}`}>
+                {!mine && newSender && <span className="message-avatar" style={{ background: colors[message.nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(message.nickname, nickname))}</span>}
+                <div className="message-content">{newSender && <div className="message-meta"><strong>{displayNickname(message.nickname, nickname)}</strong><span>{formatTime(message.createdAt)}</span></div>}{message.body && <div className="message-bubble">{message.body}{timerLabel && <span className="message-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}</div>}{message.attachment && (message.attachment.type.startsWith("video/") ? <video className="message-media" src={mediaUrl(message)} controls preload="metadata" /> : <a href={mediaUrl(message)} target="_blank" rel="noreferrer"><img className="message-media" src={mediaUrl(message)} alt={message.attachment.name} loading="lazy" /></a>)}{timerLabel && !message.body && <span className="message-timer-marker attachment-timer-marker" title={timerLabel} aria-label={timerLabel}><Timer size={12} aria-hidden="true" /></span>}</div>
+                {mine && newSender && <span className="message-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(nickname, nickname))}</span>}
               </div>;
             })}
             {error && <div className="error-note">{error}</div>}
-            <div ref={endRef} />
           </div>
         </div>
-        <footer className="composer-area"><form className="composer" onSubmit={send}><input ref={fileRef} type="file" accept="image/*,video/*" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><button type="button" className="attach-button" aria-label="Allega una foto o un video" title="Allega foto o video" onClick={() => fileRef.current?.click()}><Paperclip size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={(!draft.trim() && !attachment) || sending} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form>{attachment && <div className="attachment-preview"><span>{attachment.type.startsWith("video/") ? "Video" : "Immagine"}: {attachment.name}</span><button type="button" aria-label="Rimuovi allegato" onClick={() => setAttachment(null)}><X size={14} /></button></div>}<div className="composer-caption"><span><LockKeyhole size={11} /> Questo spazio è vostro.</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga · file max 2,5 MB</span></div></footer>
+        <footer className="composer-area"><form className="composer" onSubmit={send}><input ref={fileRef} type="file" accept="image/*,video/*" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { pickFile(e.target.files?.[0]); e.currentTarget.value = ""; }} /><button type="button" className="attach-button" aria-label="Scatta una foto" title="Scatta una foto" onClick={() => cameraRef.current?.click()}><Camera size={17} /></button><button type="button" className="attach-button" aria-label="Allega una foto o un video" title="Allega foto o video" onClick={() => fileRef.current?.click()}><Paperclip size={17} /></button><textarea ref={inputRef} rows={1} value={draft} maxLength={2000} onChange={(e) => { setDraft(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 144)}px`; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder="Scrivi qualcosa di bello..." aria-label="Scrivi un messaggio" /><span className="composer-separator" /><button type="submit" className="send-button" disabled={(!draft.trim() && !attachment) || sending || !keyReady} aria-label="Invia messaggio"><ArrowUp size={18} /></button></form>{attachment && <div className="attachment-preview"><span>{attachment.type.startsWith("video/") ? "Video" : "Immagine"}: {attachment.name}</span><button type="button" aria-label="Rimuovi allegato" onClick={() => setAttachment(null)}><X size={14} /></button></div>}<div className="composer-caption"><span><LockKeyhole size={11} /> {roomKey ? "Cifratura end-to-end attiva" : "Cifratura non disponibile"}</span><span><kbd>↵</kbd> invia&nbsp; · &nbsp;<kbd>⇧ ↵</kbd> nuova riga · file max 2 MB</span></div></footer>
       </section>
-      <aside className="info-panel"><div className="info-top"><span>IL VOSTRO POSTO</span><MoreHorizontal size={18} /></div><div className="room-art"><div className="art-ring ring-one" /><div className="art-ring ring-two" /><div className="art-heart">♡</div><span className="art-star star-a">✳</span><span className="art-star star-b">·</span><span className="art-star star-c">✳</span></div><div className="room-info"><span className="room-label">QUESTA CHAT</span><h2>Il salotto</h2><p>Un posto tranquillo per dirsi le cose con calma.</p><button className="info-invite" onClick={copyLink}><Users size={15} /> {copied ? "Invito copiato" : "Invita una persona"}<ArrowDown size={13} /></button></div><div className="info-divider" /><div className="people-heading"><span>QUI DENTRO</span><span className="people-count">{onlineCount}/2</span></div><div className="people-list"><div className="person"><span className="person-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(nickname)}</span><span>{nickname}<small>sei tu</small></span><i className="person-online" /></div>{onlineCount > 1 && <div className="person"><span className="person-avatar person-guest">+</span><span>Qualcuno di caro<small>qui con te</small></span><i className="person-online" /></div>}</div><button className="leave-link" onClick={leave}>Esci da questo spazio <ArrowLeft size={13} /></button><div className="info-footer"><span>DUETTO<span className="brand-period">.</span></span><span>POCO, MA BENE.</span></div></aside>
+      <aside className="info-panel"><div className="info-top"><span>IL VOSTRO POSTO</span><MoreHorizontal size={18} /></div><div className="room-art"><div className="art-ring ring-one" /><div className="art-ring ring-two" /><div className="art-heart">♡</div><span className="art-star star-a">✳</span><span className="art-star star-b">·</span><span className="art-star star-c">✳</span></div><div className="room-info"><span className="room-label">QUESTA CHAT</span><h2>Il salotto</h2><p>Un posto tranquillo per dirsi le cose con calma.</p><button className="info-invite" onClick={copyLink}><Users size={15} /> {copied ? "Invito copiato" : "Invita una persona"}<ArrowDown size={13} /></button></div><div className="info-divider" /><div className="people-heading"><span>QUI DENTRO</span><span className="people-count">{onlineCount}/2</span></div><div className="people-list"><div className="person"><span className="person-avatar" style={{ background: colors[nickname.charCodeAt(0) % colors.length] }}>{initials(displayNickname(nickname, nickname))}</span><span>{displayNickname(nickname, nickname)}<small>sei tu</small></span><i className="person-online" /></div>{onlineCount > 1 && <div className="person"><span className="person-avatar person-guest">+</span><span>amoretuo<small>qui con te</small></span><i className="person-online" /></div>}</div><button className="leave-link" onClick={leave}>Esci da questo spazio <ArrowLeft size={13} /></button><div className="info-footer"><span>DUETTO<span className="brand-period">.</span></span><span>POCO, MA BENE.</span></div></aside>
     </main>
   );
 }
