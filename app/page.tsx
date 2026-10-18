@@ -67,6 +67,8 @@ export default function Home() {
   const [error, setError] = useState("");
   const [onlineCount, setOnlineCount] = useState(1);
   const [ttlSeconds, setTtlSeconds] = useState(0);
+  const [clockTick, setClockTick] = useState(0);
+  const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -76,6 +78,8 @@ export default function Home() {
   const messageFetchId = useRef(0);
   const shouldAutoScroll = useRef(true);
   const pendingMessage = useRef<{ id: string; body: string; attachmentData: string | null; encryptedBody: string | null } | null>(null);
+  const effectiveNow = clockTick - serverTimeOffsetMs;
+  const visibleMessages = messages.filter((message) => !message.expiresAt || Date.parse(message.expiresAt) > effectiveNow);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -140,10 +144,16 @@ export default function Home() {
     const fetchId = ++messageFetchId.current;
     try {
       const params = new URLSearchParams({ room: roomId, session: sessionId, nickname });
+      const requestStartedAt = Date.now();
       const response = await fetch(`/api/messages?${params.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Connessione al server non riuscita.");
-      const data = await response.json() as { messages: ChatMessage[]; onlineCount?: number; ttlSeconds?: number };
+      const data = await response.json() as { messages: ChatMessage[]; onlineCount?: number; ttlSeconds?: number; serverNow?: string };
+      const responseReceivedAt = Date.now();
       if (fetchId !== messageFetchId.current) return;
+      if (data.serverNow) {
+        const serverTime = Date.parse(data.serverNow);
+        if (Number.isFinite(serverTime)) setServerTimeOffsetMs((requestStartedAt + (responseReceivedAt - requestStartedAt) / 2) - serverTime);
+      }
       const decryptedMessages = await Promise.all(data.messages.map((message) => roomKey ? decryptMessage(roomKey, message) : message));
       if (fetchId !== messageFetchId.current) return;
       setMessages(decryptedMessages);
@@ -165,6 +175,13 @@ export default function Home() {
     const timer = window.setInterval(() => void fetchMessages(), 2200);
     return () => window.clearInterval(timer);
   }, [nickname, roomId, sessionId, fetchMessages]);
+
+  useEffect(() => {
+    const tick = () => setClockTick(Date.now());
+    tick();
+    const timer = window.setInterval(tick, 500);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -345,11 +362,11 @@ export default function Home() {
         <div className="conversation" ref={conversationRef} role="region" aria-label="Conversazione" tabIndex={0} onScroll={(event) => { const element = event.currentTarget; shouldAutoScroll.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; }}>
           <div className="conversation-inner">
             <div className="welcome-card"><div className="welcome-icon"><MessageCircle size={19} /></div><p className="welcome-kicker">BENVENUTI NEL VOSTRO SPAZIO</p><h2>Le conversazioni<br />cominciano da qui.</h2><p>Solo voi due. Nessuna fretta.</p><div className="welcome-rule"><span /></div></div>
-            {messages.length > 0 && <div className="history-divider"><span>LA VOSTRA CONVERSAZIONE</span></div>}
-            {loading && messages.length === 0 && <div className="loading-note"><span className="loader" /> Sto preparando il salotto...</div>}
-            {messages.map((message, index) => {
+            {visibleMessages.length > 0 && <div className="history-divider"><span>LA VOSTRA CONVERSAZIONE</span></div>}
+            {loading && visibleMessages.length === 0 && <div className="loading-note"><span className="loader" /> Sto preparando il salotto...</div>}
+            {visibleMessages.map((message, index) => {
               const mine = message.nickname === nickname;
-              const previous = messages[index - 1];
+              const previous = visibleMessages[index - 1];
               const newSender = !previous || previous.nickname !== message.nickname;
               const timerLabel = message.expiresAt ? `Messaggio con timer, scade alle ${formatTime(message.expiresAt)}` : "";
       return <div key={message.id} className={`message-row ${mine ? "mine" : "theirs"} ${newSender ? "new-sender" : ""}`}>
