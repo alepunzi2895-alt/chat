@@ -45,6 +45,14 @@ function database() {
       expires_at TEXT NOT NULL
     )`);
     await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS message_expiry_room_date ON message_expiry(room, expires_at)");
+    await globalForDb.duettoDb!.execute(`CREATE TABLE IF NOT EXISTS message_timers (
+      message_id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      ttl_seconds INTEGER NOT NULL,
+      read_at TEXT,
+      expires_at TEXT
+    )`);
+    await globalForDb.duettoDb!.execute("CREATE INDEX IF NOT EXISTS message_timers_room_date ON message_timers(room, expires_at)");
   });
   return { db: globalForDb.duettoDb, ready: globalForDb.duettoReady };
 }
@@ -65,8 +73,11 @@ export async function GET(request: NextRequest) {
     const serverNow = new Date();
     const now = serverNow.toISOString();
     await db.execute({ sql: "DELETE FROM attachments WHERE room = ? AND message_id IN (SELECT message_id FROM message_expiry WHERE room = ? AND expires_at <= ?)", args: [room, room, now] });
+    await db.execute({ sql: "DELETE FROM attachments WHERE room = ? AND message_id IN (SELECT message_id FROM message_timers WHERE room = ? AND expires_at IS NOT NULL AND expires_at <= ?)", args: [room, room, now] });
     await db.execute({ sql: "DELETE FROM messages WHERE room = ? AND id IN (SELECT message_id FROM message_expiry WHERE room = ? AND expires_at <= ?)", args: [room, room, now] });
+    await db.execute({ sql: "DELETE FROM messages WHERE room = ? AND id IN (SELECT message_id FROM message_timers WHERE room = ? AND expires_at IS NOT NULL AND expires_at <= ?)", args: [room, room, now] });
     await db.execute({ sql: "DELETE FROM message_expiry WHERE room = ? AND expires_at <= ?", args: [room, now] });
+    await db.execute({ sql: "DELETE FROM message_timers WHERE room = ? AND expires_at IS NOT NULL AND expires_at <= ?", args: [room, now] });
     const attachmentId = request.nextUrl.searchParams.get("attachmentId");
     if (attachmentId) {
       const file = await db.execute({ sql: "SELECT name, type, data FROM attachments WHERE message_id = ? AND room = ?", args: [attachmentId, room] });
@@ -82,8 +93,8 @@ export async function GET(request: NextRequest) {
       args: [room, session, storedNickname, lastSeen],
     });
     await db.execute({ sql: "DELETE FROM participants WHERE room = ? AND last_seen < ?", args: [room, new Date(Date.now() - 60_000).toISOString()] });
-    const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.room = ? ORDER BY m.created_at DESC LIMIT 200", args: [room] });
-    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null })).reverse();
+    const result = await db.execute({ sql: "SELECT m.id, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, COALESCE(mt.expires_at, e.expires_at) AS expires_at, mt.ttl_seconds AS timer_seconds FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room LEFT JOIN message_timers mt ON mt.message_id = m.id AND mt.room = m.room WHERE m.room = ? ORDER BY m.created_at DESC LIMIT 200", args: [room] });
+    const messages = result.rows.map((row) => ({ id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null, timerSeconds: row.timer_seconds ? Number(row.timer_seconds) : null })).reverse();
     const people = await db.execute({ sql: "SELECT COUNT(DISTINCT nickname) AS count FROM participants WHERE room = ? AND last_seen >= ?", args: [room, new Date(Date.now() - 45_000).toISOString()] });
     const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
     return NextResponse.json({ messages, onlineCount: Math.min(2, Number(people.rows[0]?.count ?? 1)), ttlSeconds: Number(setting.rows[0]?.ttl_seconds ?? 0), serverNow: serverNow.toISOString() }, { headers: { "cache-control": "no-store" } });
@@ -97,7 +108,7 @@ export async function POST(request: NextRequest) {
   let payload: unknown;
   try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
   if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
-  const { room, nickname, body, attachment, clientMessageId } = payload as Record<string, unknown>;
+  const { room, nickname, body, attachment, clientMessageId, timerStart } = payload as Record<string, unknown>;
   const hasAttachment = attachment !== undefined && attachment !== null;
   const file = hasAttachment && typeof attachment === "object" ? attachment as Record<string, unknown> : null;
   const data = typeof file?.data === "string" ? file.data : "";
@@ -113,30 +124,32 @@ export async function POST(request: NextRequest) {
   try {
     const { db, ready } = database();
     await ready;
-    const existing = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
+    const existing = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, COALESCE(mt.expires_at, e.expires_at) AS expires_at, mt.ttl_seconds AS timer_seconds FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room LEFT JOIN message_timers mt ON mt.message_id = m.id AND mt.room = m.room WHERE m.id = ?", args: [id] });
     const existingRow = existing.rows[0];
     if (existingRow) {
       if (String(existingRow.room) !== room || String(existingRow.nickname) !== storedNickname || String(existingRow.body) !== body.trim()) {
         return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
       }
-      return NextResponse.json({ message: { id: String(existingRow.id), nickname: String(existingRow.nickname), body: String(existingRow.body), createdAt: String(existingRow.created_at), attachment: existingRow.attachment_type ? { name: String(existingRow.attachment_name), type: String(existingRow.attachment_type) } : null, expiresAt: existingRow.expires_at ? String(existingRow.expires_at) : null } }, { status: 201 });
+      return NextResponse.json({ message: { id: String(existingRow.id), nickname: String(existingRow.nickname), body: String(existingRow.body), createdAt: String(existingRow.created_at), attachment: existingRow.attachment_type ? { name: String(existingRow.attachment_name), type: String(existingRow.attachment_type) } : null, expiresAt: existingRow.expires_at ? String(existingRow.expires_at) : null, timerSeconds: existingRow.timer_seconds ? Number(existingRow.timer_seconds) : null } }, { status: 201 });
     }
     const setting = await db.execute({ sql: "SELECT ttl_seconds FROM room_settings WHERE room = ?", args: [room] });
     const ttlSeconds = Number(setting.rows[0]?.ttl_seconds ?? 0);
     const createdAt = new Date().toISOString();
-    const expiresAt = ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null;
+    const readBasedTimer = timerStart === "on_read";
+    const expiresAt = ttlSeconds > 0 && !readBasedTimer ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null;
     const statements: Array<{ sql: string; args: (string | number | null)[] }> = [
       { sql: "INSERT OR IGNORE INTO messages (id, room, nickname, body, created_at) VALUES (?, ?, ?, ?, ?)", args: [id, room, storedNickname, body.trim(), createdAt] },
     ];
     if (file) statements.push({ sql: "INSERT OR IGNORE INTO attachments (message_id, room, name, type, data) VALUES (?, ?, ?, ?, ?)", args: [id, room, file.name as string, file.type as string, encoded] });
     if (expiresAt) statements.push({ sql: "INSERT OR IGNORE INTO message_expiry (message_id, room, expires_at) VALUES (?, ?, ?)", args: [id, room, expiresAt] });
+    if (ttlSeconds > 0 && readBasedTimer) statements.push({ sql: "INSERT OR IGNORE INTO message_timers (message_id, room, ttl_seconds) VALUES (?, ?, ?)", args: [id, room, ttlSeconds] });
     await db.batch(statements, "write");
-    const saved = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, e.expires_at FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room WHERE m.id = ?", args: [id] });
+    const saved = await db.execute({ sql: "SELECT m.id, m.room, m.nickname, m.body, m.created_at, a.name AS attachment_name, a.type AS attachment_type, COALESCE(mt.expires_at, e.expires_at) AS expires_at, mt.ttl_seconds AS timer_seconds FROM messages m LEFT JOIN attachments a ON a.message_id = m.id AND a.room = m.room LEFT JOIN message_expiry e ON e.message_id = m.id AND e.room = m.room LEFT JOIN message_timers mt ON mt.message_id = m.id AND mt.room = m.room WHERE m.id = ?", args: [id] });
     const row = saved.rows[0];
     if (!row || String(row.room) !== room || String(row.nickname) !== storedNickname || String(row.body) !== body.trim()) {
       return NextResponse.json({ error: "ID del messaggio già utilizzato." }, { status: 409 });
     }
-    return NextResponse.json({ message: { id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null } }, { status: 201 });
+    return NextResponse.json({ message: { id: String(row.id), nickname: String(row.nickname), body: String(row.body), createdAt: String(row.created_at), attachment: row.attachment_type ? { name: String(row.attachment_name), type: String(row.attachment_type) } : null, expiresAt: row.expires_at ? String(row.expires_at) : null, timerSeconds: row.timer_seconds ? Number(row.timer_seconds) : null } }, { status: 201 });
   } catch (error) {
     console.error("Turso write error:", error);
     return NextResponse.json({ error: "Impossibile salvare il messaggio." }, { status: 503 });
@@ -147,8 +160,32 @@ export async function PATCH(request: NextRequest) {
   let payload: unknown;
   try { payload = await request.json(); } catch { return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 }); }
   if (!payload || typeof payload !== "object") return NextResponse.json({ error: "Richiesta non valida." }, { status: 400 });
-  const { room, nickname, ttlSeconds } = payload as Record<string, unknown>;
-  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || ![0, 300, 900, 1800, 3600, 86400, 604800].includes(Number(ttlSeconds))) {
+  const { room, nickname, ttlSeconds, action, messageIds } = payload as Record<string, unknown>;
+  if (action === "read") {
+    if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || !Array.isArray(messageIds) || messageIds.length > 200 || messageIds.some((id) => typeof id !== "string" || !/^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(id))) {
+      return NextResponse.json({ error: "Lettura non valida." }, { status: 400 });
+    }
+    try {
+      const { db, ready } = database();
+      await ready;
+      const storedNickname = normalizeNickname(nickname.trim());
+      const started: Array<{ id: string; expiresAt: string }> = [];
+      for (const id of [...new Set(messageIds as string[])]) {
+        const result = await db.execute({ sql: "SELECT m.nickname, mt.ttl_seconds, mt.read_at FROM message_timers mt JOIN messages m ON m.id = mt.message_id AND m.room = mt.room WHERE mt.room = ? AND mt.message_id = ?", args: [room, id] });
+        const row = result.rows[0];
+        if (!row || normalizeNickname(String(row.nickname)) === storedNickname || row.read_at || Number(row.ttl_seconds) <= 0) continue;
+        const readAt = new Date();
+        const expiresAt = new Date(readAt.getTime() + Number(row.ttl_seconds) * 1000).toISOString();
+        const saved = await db.execute({ sql: "UPDATE message_timers SET read_at = ?, expires_at = ? WHERE room = ? AND message_id = ? AND read_at IS NULL AND expires_at IS NULL", args: [readAt.toISOString(), expiresAt, room, id] });
+        if (saved.rowsAffected) started.push({ id, expiresAt });
+      }
+      return NextResponse.json({ started }, { headers: { "cache-control": "no-store" } });
+    } catch (error) {
+      console.error("Turso read receipt error:", error);
+      return NextResponse.json({ error: "Impossibile avviare il timer." }, { status: 503 });
+    }
+  }
+  if (!validRoom(room) || typeof nickname !== "string" || !nickname.trim() || nickname.length > 24 || ![0, 300, 600, 900, 1800, 3600, 86400, 604800].includes(Number(ttlSeconds))) {
     return NextResponse.json({ error: "Impostazioni non valide." }, { status: 400 });
   }
   try {
@@ -173,6 +210,7 @@ export async function DELETE(request: NextRequest) {
     await ready;
     await db.execute({ sql: "DELETE FROM attachments WHERE room = ?", args: [room] });
     await db.execute({ sql: "DELETE FROM message_expiry WHERE room = ?", args: [room] });
+    await db.execute({ sql: "DELETE FROM message_timers WHERE room = ?", args: [room] });
     const result = await db.execute({ sql: "DELETE FROM messages WHERE room = ?", args: [room] });
     return NextResponse.json({ deleted: result.rowsAffected });
   } catch (error) {
