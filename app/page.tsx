@@ -95,23 +95,25 @@ export default function Home() {
       ? linkedRoom
       : savedRoom ?? crypto.randomUUID().replaceAll("-", "").slice(0, 10);
     window.localStorage.setItem("duetto-room", room);
-    if (!linkedRoom || linkedRoom !== room) {
-      params.set("room", room);
-      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
-    }
+    params.set("room", room);
     setRoomId(room);
     void (async () => {
       try {
         const match = window.location.hash.match(/(?:^#|&)key=([A-Za-z0-9_-]{43})/);
+        const savedKey = window.localStorage.getItem(`duetto-room-key:${room}`);
         let keyBytes: Uint8Array;
         if (match) {
           const raw = match[1].replace(/-/g, "+").replace(/_/g, "/");
           keyBytes = base64ToBytes(raw + "=");
+        } else if (savedKey && /^[A-Za-z0-9_-]{43}$/.test(savedKey)) {
+          const raw = savedKey.replace(/-/g, "+").replace(/_/g, "/");
+          keyBytes = base64ToBytes(raw + "=");
         } else {
           keyBytes = crypto.getRandomValues(new Uint8Array(32));
-          const encoded = bytesToBase64(keyBytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-          window.history.replaceState({}, "", `${window.location.pathname}${window.location.search}#key=${encoded}`);
         }
+        const encoded = bytesToBase64(keyBytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+        window.localStorage.setItem(`duetto-room-key:${room}`, encoded);
+        window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}#key=${encoded}`);
         setRoomKey(await crypto.subtle.importKey("raw", toArrayBuffer(keyBytes), "AES-GCM", false, ["encrypt", "decrypt"]));
       } catch {
         setError("Non riesco a inizializzare la cifratura su questo browser.");
@@ -132,6 +134,8 @@ export default function Home() {
       if (!match) return;
       try {
         const raw = match[1].replace(/-/g, "+").replace(/_/g, "/");
+        const activeRoom = new URLSearchParams(window.location.search).get("room");
+        if (activeRoom && /^[a-zA-Z0-9_-]{1,48}$/.test(activeRoom)) window.localStorage.setItem(`duetto-room-key:${activeRoom}`, match[1]);
         pendingMessage.current = null;
         setKeyReady(false);
         void crypto.subtle.importKey("raw", toArrayBuffer(base64ToBytes(raw + "=")), "AES-GCM", false, ["encrypt", "decrypt"])
