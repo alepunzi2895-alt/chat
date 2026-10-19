@@ -343,7 +343,8 @@ export default function Home() {
 
   function openCamera() {
     const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-    if (!mobile && navigator.mediaDevices?.getUserMedia) {
+    const mediaDevices = Reflect.get(navigator, "mediaDevices") as MediaDevices | undefined;
+    if (!mobile && typeof mediaDevices?.getUserMedia === "function") {
       setWebcamError("");
       setShowWebcam(true);
     } else {
